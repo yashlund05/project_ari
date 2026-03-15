@@ -1,0 +1,84 @@
+# ===================================
+# DATA CONFIGURATION
+# ===================================
+
+data:
+  dataset_path: "data/btc_usdt_data.csv"
+  date_column: "date"
+
+# ===================================
+# FEATURE PARAMETERS
+# ===================================
+
+features:
+  volatility_short_window: 7
+  volatility_long_window: 30
+  momentum_short_window: 7
+  momentum_long_window: 30
+  rsi_period: 14
+  volume_zscore_window: 30
+
+# ===================================
+# MODEL SETTINGS
+# ===================================
+
+model:
+  target_column: "target_return"
+  prediction_column: "predicted_return"
+
+# ===================================
+# REGIME DETECTION
+# ===================================
+
+regime:
+  labels:
+    - BULL
+    - BEAR
+    - SIDEWAYS
+
+  entropy_thresholds:
+    strong_trend: 0.2
+    uncertain_market: 0.4
+
+# ===================================
+# SIGNAL GENERATION
+# ===================================
+
+signals:
+  long_threshold: 0.001
+  short_threshold: -0.001
+  hold_band: 0.0005
+
+# ===================================
+# POSITION SIZING
+# ===================================
+
+risk_management:
+  risk_target: 0.02
+  target_volatility: 0.02
+
+  position_limits:
+    min_position: 0.0
+    max_position: 1.0
+
+  volatility_adjustment:
+    min: 0.3
+    max: 1.5
+
+# ===================================
+# BACKTEST SETTINGS
+# ===================================
+
+backtest:
+  initial_capital: 10000
+
+  transaction_cost:
+    fee_rate: 0.0015   # 0.15% competition rule
+
+# ===================================
+# OUTPUT SETTINGS
+# ===================================
+
+output:
+  save_results: true
+  results_folder: "results/"

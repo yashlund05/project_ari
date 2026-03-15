@@ -1,0 +1,36 @@
+==============================================================
+          PROJECT ARI — TECHKRITI COMPETITION SCORECARD       
+                 Generated : 2026-03-10 19:05:02              
+==============================================================
+
+  ── PERIOD ─────────────────────────────────────────────────
+  Start date                       2023-03-20
+  End date                         2023-12-30
+  Total trading days               286
+
+  ── PROFIT BREAKDOWN ────────────────────────────────────────
+  Gross Profit                     +103.61 %
+  Gross Loss                       +64.00 %
+  Net Profit                       +39.62 %
+  Transaction Cost Drag            +0.92 %
+
+  ── BENCHMARK COMPARISON ────────────────────────────────────
+  Buy & Hold Return (BTC)          +51.82 %
+  Strategy Net Return              +45.27 %
+  Alpha vs B&H                     -6.55 %
+  Annualised Return (CAGR)         +38.96 %
+  Annualised Volatility            +20.14 %
+
+  ── RISK-ADJUSTED METRICS ───────────────────────────────────
+  Sharpe Ratio                     1.9349
+  Sortino Ratio                    2.6183
+  Calmar Ratio                     3.0534
+  Max Drawdown                     -12.76 %
+
+  ── TRADE STATISTICS ────────────────────────────────────────
+  Total Closed Trades              165
+  Stop-Loss Triggered (rows)       0
+  Win Rate                         +43.64 %
+  Profit Factor                    1.6190
+
+==============================================================
