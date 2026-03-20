@@ -35,6 +35,13 @@ The system follows a modular **Object-Oriented (OOP)** pipeline:
 2. **Run Strategy**: Execute all cells in `master.ipynb`.
 3. **View Results**: Performance metrics and plots are output to `results/plots/`.
 
+## **Quick Start: Reproducing Results**
+To reproduce the +27.16% Alpha scorecard and equity plots:
+1. Ensure `data/raw/btc_dataset.csv` and `data/processed/predictions.csv` are present.
+2. Run all cells in `master.ipynb`.
+3. The system will automatically execute the Preprocess -> Detect -> Generate -> Backtest pipeline.
+4. Final metrics will print as a 'Competition Scorecard' and plots will save to `results/plots/`.
+
 ---
 **Developer:** Yash | 2nd Year AIML Engineering (Pune)
 **Competition:** Techkriti '26 – IIT Kanpur (Beat the Market Challenge)

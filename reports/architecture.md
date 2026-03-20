@@ -1,144 +1,31 @@
-# System Architecture – Adaptive BTC Trading Strategy
+# Project ARI: System Architecture & Technical Blueprint
 
-## Overview
+## 1. Executive Summary
+Project ARI (Adaptive Regime Intelligence) is a modular quantitative trading framework designed for the BTC/USDT pair. The system addresses market non-stationarity by employing unsupervised regime discovery to route data between specialized execution engines.
 
-This project implements an adaptive algorithmic trading system designed for the BTC/USDT market.  
-The system combines machine learning prediction, market regime detection, and rule-based risk management to generate trading decisions.
+## 2. The Processing Pipeline
+The system operates in four distinct stages to ensure data integrity and algorithmic adaptability:
 
-The architecture is designed to be modular so that individual components can be improved or replaced independently.
+### Stage 1: Data Preprocessing & Winsorization
+* **Outlier Management**: To handle high-volatility "fat tails" in crypto, features are Winsorized at ±3.0σ.
+* **Feature Engineering**: 13 primary signals are generated, including VWAP Deviation, RSI-14, and Volume Z-scores.
 
----
+### Stage 2: HMM Regime Detection
+* **Model**: A Gaussian Hidden Markov Model (HMM) identifies 4 latent market states:
+    * **SIDEWAYS**: Optimized for Mean-Reversion.
+    * **RECOVERY**: Transition state for Trend-Following.
+    * **BULL**: High-conviction Trend-Following.
+    * **BEAR**: Defensive Mean-Reversion.
 
-## System Pipeline
+### Stage 3: Information-Theoretic Risk Gating
+* **Shannon Entropy Kill-Switch**: The system calculates the entropy ($H$) of state probabilities.
+* **Hard Cash Lock**: If $H \ge 0.50$, the market is deemed "too chaotic" for reliable prediction, and the system forces a 100% Cash position.
 
-The complete trading pipeline consists of the following stages:
+### Stage 4: Dual-Logic Execution Router
+* **LGB Engine**: Utilizes LightGBM for gradient-boosted return prediction during Sideways/Bear regimes.
+* **Trend Engine**: Utilizes a Moving Average Convergence logic for Bull/Recovery regimes.
 
-Market Data  
-↓  
-Data Preprocessing  
-↓  
-Feature Engineering  
-↓  
-Return Prediction Model  
-↓  
-Market Regime Detection  
-↓  
-Strategy Engine  
-↓  
-Risk Management  
-↓  
-Custom Backtesting Engine  
-
----
-
-## 1. Data Preprocessing
-
-The raw BTC/USDT dataset contains historical OHLCV data.
-
-Steps performed:
-
-- timestamp validation
-- missing data handling
-- correction of invalid price values
-- normalization of volume
-
-This step ensures the dataset is suitable for quantitative analysis.
-
----
-
-## 2. Feature Engineering
-
-Multiple technical indicators are extracted from the price and volume data to capture different market characteristics.
-
-Key features include:
-
-- Log returns
-- Volatility indicators (7-day and 30-day)
-- Momentum indicators
-- Relative Strength Index (RSI)
-- VWAP deviation
-- Volume anomaly detection
-
-These features serve as inputs for the prediction model and regime detection logic.
-
----
-
-## 3. Return Prediction Model
-
-A machine learning model predicts short-term future returns based on engineered features.
-
-The prediction output is used to estimate potential market direction and assist the trading strategy in generating signals.
-
----
-
-## 4. Market Regime Detection
-
-Financial markets behave differently during different conditions.
-
-The system identifies three market regimes:
-
-- Bull Market
-- Bear Market
-- Sideways Market
-
-Regime classification helps the strategy adapt its behavior depending on market volatility and trend strength.
-
----
-
-## 5. Strategy Engine
-
-The strategy engine combines:
-
-- predicted returns
-- regime classification
-- market indicators
-
-to generate trading signals:
-
-LONG – buy Bitcoin  
-SHORT – sell or short position  
-HOLD – remain out of the market
-
-The objective is to capture profitable trends while avoiding uncertain market conditions.
-
----
-
-## 6. Risk Management
-
-Risk management is implemented through several mechanisms:
-
-- volatility-based position sizing
-- regime-based exposure control
-- capital allocation limits
-- transaction cost modelling
-
-These mechanisms help protect capital during adverse market movements.
-
----
-
-## 7. Custom Backtesting Engine
-
-A custom backtesting engine evaluates strategy performance on historical data.
-
-This engine simulates trade execution and incorporates transaction costs to ensure realistic results.
-
-Performance metrics include:
-
-- Net Profit
-- Gross Profit / Gross Loss
-- Maximum Drawdown
-- Sharpe Ratio
-- Sortino Ratio
-- Win Rate
-- Total Closed Trades
-
----
-
-## Design Goals
-
-The system is designed to achieve the following:
-
-- adaptability to changing market conditions
-- strong risk management
-- transparent trading logic
-- reproducible research results
+## 3. Risk Management & Constraints
+* **Stop-Loss**: Fixed -5.0% circuit breaker per trade.
+* **Transaction Fees**: Realistic 0.15% fee modeling applied to all trades.
+* **Execution**: Only enters Long positions or holds Cash; no Shorting enabled to reduce liquidation risk.

@@ -3,8 +3,9 @@
 # ===================================
 
 data:
-  dataset_path: "data/btc_usdt_data.csv"
+  [cite_start]dataset_path: "data/raw/btc_dataset.csv"  
   date_column: "date"
+  processed_predictions: "data/processed/predictions.csv" 
 
 # ===================================
 # FEATURE PARAMETERS
@@ -17,6 +18,7 @@ features:
   momentum_long_window: 30
   rsi_period: 14
   volume_zscore_window: 30
+  [cite_start]winsorize_limit: 3.0  
 
 # ===================================
 # MODEL SETTINGS
@@ -25,37 +27,48 @@ features:
 model:
   target_column: "target_return"
   prediction_column: "predicted_return"
+  confidence_column: "confidence" 
 
 # ===================================
-# REGIME DETECTION
+# REGIME DETECTION 
 # ===================================
 
 regime:
+  
   labels:
-    - BULL
-    - BEAR
-    - SIDEWAYS
+    0: "SIDEWAYS"     # -> LGB Branch
+    1: "RECOVERY"     # -> TREND Branch
+    2: "BULL"         # -> TREND Branch
+    3: "BEAR"         # -> LGB Branch
 
+  
   entropy_thresholds:
-    strong_trend: 0.2
-    uncertain_market: 0.4
+    kill_switch: 0.50  # Threshold used to suppress 22 signals
+    uncertain_market: 0.40
 
 # ===================================
-# SIGNAL GENERATION
+# SIGNAL GENERATION (Dual-Logic Router)
 # ===================================
 
 signals:
   long_threshold: 0.001
   short_threshold: -0.001
   hold_band: 0.0005
+  
+  regime_scaling:
+    bear: 1.2
+    bull: 0.8
+    recovery: 0.6
+    sideways: 1.1
 
 # ===================================
-# POSITION SIZING
+# POSITION SIZING & RISK MANAGEMENT
 # ===================================
 
 risk_management:
   risk_target: 0.02
   target_volatility: 0.02
+  [cite_start]stop_loss_pct: 0.05  
 
   position_limits:
     min_position: 0.0
@@ -71,9 +84,11 @@ risk_management:
 
 backtest:
   initial_capital: 10000
+  start_date: "2021-01-30"
+  end_date: "2023-12-15"
 
   transaction_cost:
-    fee_rate: 0.0015   # 0.15% competition rule
+    [cite_start]fee_rate: 0.0015  
 
 # ===================================
 # OUTPUT SETTINGS
@@ -82,3 +97,4 @@ backtest:
 output:
   save_results: true
   results_folder: "results/"
+  plots_folder: "results/plots/" 
