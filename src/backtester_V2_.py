@@ -1,20 +1,49 @@
 """
 backtester.py
 -------------
-Competition-grade portfolio backtesting engine for project_ari.
-Upgraded for Techkriti competition requirements.
+Competition-grade portfolio backtesting engine for Project ARI.
 
-Enhancements over v1
---------------------
-  • Transaction cost model  — 0.15 % fee per trade deducted from returns.
-  • Stop-loss rule          — exit (zero return) when cumulative trade
-                              return falls below -5 %.
-  • Buy-and-hold benchmark  — BTC return over the same period.
-  • Profit breakdown        — Gross Profit / Gross Loss / Net Profit.
-  • Competition metrics     — full Techkriti scorecard output.
-  • Full dataset backtest   — 2020–2023 coverage enforced.
+v3 — Regime-Gated Alignment
+-----------------------------
+Updated to handle the outputs of the v13 Regime-Gated Strategy Engine.
+All four requirements from the ARI specification are addressed:
 
-Project structure expected:
+  1. Strict Position Alignment
+     compute_positions() treats rows where signal=="HOLD" AND position_size==0
+     as a Hard Cash Lock: position is forced to 0 (not carried forward).
+     This correctly represents that the regime gate physically moves the
+     portfolio to cash, not to a "held long with zero size" state.
+
+  2. Corrected Transaction Fee Logic
+     apply_transaction_costs() only charges a fee when the position change
+     was caused by an actual BUY or SELL signal.  Hard Cash Lock transitions
+     (signal="HOLD", position_size=0) are explicitly excluded so the regime
+     gate does not generate spurious round-trip costs.
+
+  3. Institutional Scorecard — Regime-Gated Efficiency section
+     compute_metrics() and _build_report() now include:
+       • Total Signals Suppressed by Alpha Filter  (entropy gate + regime gate)
+       • Equity Saved from High-Entropy Periods    (counterfactual loss avoided)
+
+  4. Equity Curve Sanity
+     compute_equity_curve() builds three parallel curves saved to equity_curve.csv:
+       • lgbm_naive_equity  — pure LightGBM signal, no regime filter, no fees.
+                              Baseline that shows what following raw predictions
+                              alone would have yielded.
+       • gross_equity       — regime-gated strategy, before 0.15 % transaction fees.
+       • equity (net)       — regime-gated strategy, after all fees and stop-loss.
+     Comparing lgbm_naive vs gross vs net isolates the contribution of each layer.
+
+Enhancements retained from v2
+------------------------------
+  • 0.15 % per-trade transaction cost model.
+  • Stop-loss rule: exit when cumulative trade return < -5 %.
+  • Buy-and-hold BTC benchmark.
+  • Profit breakdown: Gross Profit / Gross Loss / Net Profit.
+  • Full Techkriti competition scorecard.
+
+Project structure expected
+--------------------------
     project_ari/
     ├── data/
     │   ├── processed/
@@ -26,7 +55,8 @@ Project structure expected:
     └── src/
         └── backtester.py
 
-Usage:
+Usage
+-----
     Run directly:   python src/backtester.py
     Import:         from src.backtester import backtest_pipeline
 """
@@ -54,10 +84,17 @@ SUMMARY_PATH  = RESULTS_DIR / "performance_summary.txt"
 # Constants
 # ---------------------------------------------------------------------------
 TRADING_DAYS_PER_YEAR: int  = 252
-RISK_FREE_RATE_DAILY: float = 0.0          # 0 % risk-free rate for crypto
+RISK_FREE_RATE_DAILY: float = 0.0         # 0 % risk-free rate for crypto
 
-TRANSACTION_FEE_RATE: float = 0.0015       # 0.15 % per trade (one-way)
-STOP_LOSS_THRESHOLD: float  = -0.05        # exit trade if cumulative return < -5 %
+TRANSACTION_FEE_RATE: float = 0.0015      # 0.15 % per trade (one-way)
+STOP_LOSS_THRESHOLD:  float = -0.05       # exit when cumulative trade return < -5 %
+
+# Minimum |predicted_return| required for a suppressed row to count as
+# a "would-have-been active" signal.  Matches CONFIDENCE_THRESHOLD in v13.
+SIGNAL_CONFIDENCE_FLOOR: float = 0.002
+
+# Regime labels that are hard-locked to cash by the Regime Gate (v13).
+CASH_LOCKED_REGIMES: frozenset[str] = frozenset({"BULL", "RECOVERY"})
 
 REQUIRED_COLUMNS: set[str] = {
     "date", "close", "signal", "position_size", "strategy_return", "target_return",
@@ -68,7 +105,7 @@ REQUIRED_COLUMNS: set[str] = {
 # 1. load_signals
 # ===========================================================================
 def load_signals(filepath: Path | str = INPUT_PATH) -> pd.DataFrame:
-    """Load the trading signals dataset produced by strategy_engine.py.
+    """Load the trading signals dataset produced by strategy_engine.py v13.
 
     Parameters
     ----------
@@ -110,91 +147,124 @@ def load_signals(filepath: Path | str = INPUT_PATH) -> pd.DataFrame:
     active   = (df["signal"] != "HOLD").sum()
     date_min = df["date"].min().date()
     date_max = df["date"].max().date()
+
+    # Optional v13 columns — report availability for downstream steps.
+    optional_present = [
+        c for c in ("predicted_return", "regime_entropy", "regime_label")
+        if c in df.columns
+    ]
     print(
         f"[load_signals]  Loaded {len(df):,} rows from '{filepath}'  |  "
         f"Period: {date_min} → {date_max}  |  "
-        f"Active signals (non-HOLD): {active:,}"
+        f"Active signals (non-HOLD): {active:,}  |  "
+        f"Optional v13 cols present: {optional_present}"
     )
     return df
 
 
 # ===========================================================================
-# 2. compute_positions  (new)
+# 2. compute_positions   (v3: Hard Cash Lock override)
 # ===========================================================================
 def compute_positions(df: pd.DataFrame) -> pd.DataFrame:
-    """Build a continuous position column from the signal series.
+    """Build a continuous position column, with Hard Cash Lock support.
 
-    The strategy uses position carry: a BUY opens a long (position = 1),
-    a SELL closes it (position = 0), and HOLD rows carry the previous
-    position forward unchanged.  This reflects real holding behaviour —
-    the strategy stays exposed through multi-day uptrends without exiting
-    and re-entering on every HOLD row.
+    Standard carry logic
+    --------------------
+    BUY  → position = 1  (enter long)
+    SELL → position = 0  (exit to flat)
+    HOLD → carry previous position forward
 
-    Position encoding
-    -----------------
-    1   → long (BUY signal received, or carried from prior BUY)
-    0   → flat (SELL signal received, or no position yet opened)
+    Hard Cash Lock override (v3 addition)
+    --------------------------------------
+    When the v13 Regime Gate forces ``signal = "HOLD"`` on a BULL or
+    RECOVERY row it also sets ``position_size = 0``.  Carrying the prior
+    position through such rows would misrepresent the portfolio state:
+    the strategy is *in cash*, not in a zero-sized long.
+
+    Rule:  if  signal == "HOLD"  AND  position_size == 0
+           then position = 0  (override carry; hard cash lock)
+
+    This has two downstream effects:
+      • compute_strategy_returns: position(0) × position_size(0) × target = 0  ✓
+        (already correct either way, but semantically unambiguous)
+      • apply_transaction_costs: when the lock lifts and a new BUY fires,
+        the position transitions 0→1, which is detected as a real entry
+        and charged a single round-trip fee.  Without this override the
+        position stays at 1 through the lock and the re-entry is invisible.
+
+    The ``is_hard_cash_lock`` boolean column is carried through the pipeline
+    so ``apply_transaction_costs`` can exclude lock-boundary transitions
+    from fee charges.
 
     Parameters
     ----------
     df : pd.DataFrame
-        DataFrame with a *signal* column (BUY / SELL / HOLD).
+        DataFrame with *signal* and *position_size* columns.
 
     Returns
     -------
     pd.DataFrame
-        DataFrame with *position* column appended (int, 0 or 1).
+        DataFrame with *position* (0 or 1) and *is_hard_cash_lock* columns.
     """
     df = df.copy()
+
+    # Pre-compute the cash-lock mask (vectorised, no loop needed here).
+    hard_cash_lock_mask = (df["signal"] == "HOLD") & (df["position_size"] == 0.0)
 
     position  = 0
     positions = []
 
-    for sig in df["signal"]:
+    for idx, (sig, is_locked) in enumerate(
+        zip(df["signal"], hard_cash_lock_mask)
+    ):
         if sig == "BUY":
             position = 1
         elif sig == "SELL":
             position = 0
-        # HOLD → keep previous position unchanged
+        elif is_locked:
+            # Hard Cash Lock: override carry → force flat regardless of prior state.
+            position = 0
+        # Plain HOLD (position_size > 0): carry previous position unchanged.
 
         positions.append(position)
 
-    df["position"] = positions
+    df["position"]         = positions
+    df["is_hard_cash_lock"] = hard_cash_lock_mask.values
 
-    long_days = int(sum(p == 1 for p in positions))
-    flat_days = int(sum(p == 0 for p in positions))
-    # Count position changes (transitions between 0 and 1)
-    position_changes = int(sum(
+    long_days      = int(sum(p == 1 for p in positions))
+    flat_days      = int(sum(p == 0 for p in positions))
+    lock_days      = int(hard_cash_lock_mask.sum())
+    pos_changes    = int(sum(
         1 for i in range(1, len(positions))
         if positions[i] != positions[i - 1]
     ))
 
     print(
-        f"[positions]  long_days: {long_days:,}  |  "
+        f"[compute_positions]  long_days: {long_days:,}  |  "
         f"flat_days: {flat_days:,}  |  "
-        f"position_changes: {position_changes:,}"
+        f"hard_cash_lock_days: {lock_days:,}  |  "
+        f"position_changes: {pos_changes:,}"
     )
     return df
 
 
 # ===========================================================================
-# 3. compute_strategy_returns  (new)
+# 3. compute_strategy_returns
 # ===========================================================================
 def compute_strategy_returns(df: pd.DataFrame) -> pd.DataFrame:
-    """Recompute strategy_return as position × market_return.
+    """Recompute strategy_return as position × position_size × target_return.
 
-    Overwrites the *strategy_return* column that was pre-computed by
-    strategy_engine.py with a return series that correctly reflects
-    carry exposure: on every day the position is long (position = 1),
-    the strategy earns the market's daily return; on flat days
-    (position = 0) it earns nothing.
+    With the v3 Hard Cash Lock override in compute_positions:
+      • Cash-locked rows have position = 0 AND position_size = 0  → return = 0
+      • Active rows have position = 1 (or 0 for SELL) AND non-zero position_size
 
-    The *position_size* column scales the exposure so that sizing logic
-    from the strategy engine is honoured.
-
-    Formula
-    -------
-        strategy_return = position × position_size × target_return
+    The *position_size* column is the primary return multiplier.  It already
+    encodes all v13 sizing decisions:
+      • Regime scale (BEAR ×1.20, SIDEWAYS ×1.10, BULL/RECOVERY ×0.00)
+      • Inverse-volatility base sizing
+      • 30-day vol-targeting adjustment
+      • Confidence-floor scalar (0.6 – 1.5)
+      • Heatmap Vol-Entropy 50 % reduction scalar
 
     Parameters
     ----------
@@ -204,7 +274,7 @@ def compute_strategy_returns(df: pd.DataFrame) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        DataFrame with *strategy_return* recomputed.
+        DataFrame with *strategy_return* recomputed in-place.
     """
     df = df.copy()
     df["strategy_return"] = df["position"] * df["position_size"] * df["target_return"]
@@ -212,33 +282,46 @@ def compute_strategy_returns(df: pd.DataFrame) -> pd.DataFrame:
     cumulative = df["strategy_return"].sum()
     print(
         f"[compute_strategy_returns]  "
-        f"Cumulative gross return: {cumulative:+.4f}  "
+        f"Cumulative gross return (pre-fee): {cumulative:+.4f} "
         f"({cumulative * 100:+.2f} %)"
     )
     return df
 
 
 # ===========================================================================
-# 4. apply_transaction_costs  (modified — charges on position changes only)
+# 4. apply_transaction_costs   (v3: fee gated to real BUY/SELL signals only)
 # ===========================================================================
 def apply_transaction_costs(
-    df: pd.DataFrame,
+    df:       pd.DataFrame,
     fee_rate: float = TRANSACTION_FEE_RATE,
 ) -> pd.DataFrame:
-    """Deduct transaction costs only when the position changes.
+    """Deduct transaction costs only when a real BUY or SELL signal fires.
 
-    A fee of *fee_rate* (0.15 %) is subtracted from *strategy_return*
-    on rows where the *position* column changes value relative to the
-    previous row (i.e. an actual trade took place).  HOLD rows that carry
-    an existing position are unaffected — no new trade means no new cost.
+    Fee logic (v3)
+    --------------
+    A fee is charged when ALL THREE of the following hold simultaneously:
+
+      1. The *position* column changes value relative to the prior row.
+         (A real trade changed the portfolio's direction.)
+
+      2. The current row's *signal* is BUY or SELL — not HOLD.
+         This is the primary guard against Hard Cash Lock transitions.
+         When the regime gate overrides a row to HOLD (position_size=0),
+         the position may still change (0→1 or 1→0 at lock boundaries),
+         but no real order was submitted, so no fee should be charged.
+
+      3. The row is not flagged as *is_hard_cash_lock*.
+         Second-level guard: ensures that even an edge case where a lock
+         boundary coincides with a genuine signal cannot silently slip
+         through without the double-check.
 
     The raw pre-cost return is preserved in *gross_return*.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Signals DataFrame with *position*, *position_size*, and
-        *strategy_return* columns.
+        DataFrame with *position*, *position_size*, *signal*,
+        *is_hard_cash_lock*, and *strategy_return* columns.
     fee_rate : float
         One-way transaction fee as a decimal fraction.  Default 0.0015.
 
@@ -247,27 +330,39 @@ def apply_transaction_costs(
     pd.DataFrame
         DataFrame with:
           • *gross_return*     — strategy_return before cost deduction.
-          • *transaction_cost* — fee charged on position-change rows (0 elsewhere).
-          • *strategy_return*  — net return after cost deduction (in-place).
+          • *transaction_cost* — fee charged on real-trade rows (0 elsewhere).
+          • *strategy_return*  — net return after cost deduction.
     """
     df = df.copy()
     df["gross_return"] = df["strategy_return"].copy()
 
-    # A cost is incurred only when position changes (a real trade occurs)
-    prev_position = df["position"].shift(1).fillna(0).astype(int)
+    # ── Condition 1: position changed ────────────────────────────────────────
+    prev_position    = df["position"].shift(1).fillna(0).astype(int)
     position_changed = df["position"] != prev_position
 
+    # ── Condition 2: signal is a real trade directive (not HOLD) ─────────────
+    real_signal = df["signal"].isin({"BUY", "SELL"})
+
+    # ── Condition 3: not a Hard Cash Lock row ─────────────────────────────────
+    not_locked = ~df["is_hard_cash_lock"]
+
+    # Fee is charged only when all three conditions hold.
+    fee_mask = position_changed & real_signal & not_locked
+
+    n_lock_excluded = int((position_changed & ~real_signal).sum())
+    n_charged       = int(fee_mask.sum())
+
     df["transaction_cost"] = 0.0
-    df.loc[position_changed, "transaction_cost"] = (
-        fee_rate * df.loc[position_changed, "position_size"]
+    df.loc[fee_mask, "transaction_cost"] = (
+        fee_rate * df.loc[fee_mask, "position_size"]
     )
     df["strategy_return"] = df["gross_return"] - df["transaction_cost"]
 
     total_cost = df["transaction_cost"].sum()
-    n_charged  = position_changed.sum()
     print(
         f"[apply_transaction_costs]  Fee rate: {fee_rate * 100:.3f} %  |  "
-        f"Trades charged: {n_charged:,}  |  "
+        f"Real-trade rows charged: {n_charged:,}  |  "
+        f"Hard-cash-lock transitions excluded: {n_lock_excluded:,}  |  "
         f"Total cost drag: {total_cost * 100:.4f} %"
     )
     return df
@@ -277,7 +372,7 @@ def apply_transaction_costs(
 # 5. apply_stop_loss
 # ===========================================================================
 def apply_stop_loss(
-    df: pd.DataFrame,
+    df:        pd.DataFrame,
     threshold: float = STOP_LOSS_THRESHOLD,
 ) -> pd.DataFrame:
     """Zero out returns once a cumulative stop-loss level is breached.
@@ -290,10 +385,13 @@ def apply_stop_loss(
     subsequent rows in that active run are zeroed out.  The counter
     resets when a HOLD row is encountered (new trade begins).
 
+    Hard Cash Lock rows (signal=HOLD) reset the stop-loss counter
+    identically to ordinary HOLD rows: the regime gate forces a full
+    exit to cash, so any prior trade's running loss is cleared.
+
     Parameters
     ----------
     df : pd.DataFrame
-        DataFrame with *signal* and *strategy_return* columns.
     threshold : float
         Stop-loss level as a negative decimal fraction.  Default -0.05.
 
@@ -314,6 +412,7 @@ def apply_stop_loss(
         sig = df.at[idx, "signal"]
 
         if sig == "HOLD":
+            # Both ordinary HOLDs and Hard Cash Lock HOLDs reset the counter.
             cum_return = 0.0
             stopped    = False
             continue
@@ -352,7 +451,6 @@ def compute_buy_and_hold(df: pd.DataFrame) -> float:
     Parameters
     ----------
     df : pd.DataFrame
-        Signals DataFrame containing *close* prices.
 
     Returns
     -------
@@ -372,33 +470,79 @@ def compute_buy_and_hold(df: pd.DataFrame) -> float:
 
 
 # ===========================================================================
-# 7. compute_equity_curve
+# 7. compute_equity_curve   (v3: gross_equity + lgbm_naive_equity added)
 # ===========================================================================
 def compute_equity_curve(df: pd.DataFrame) -> pd.DataFrame:
-    """Build the portfolio equity curve from net (post-cost) strategy returns.
+    """Build three parallel equity curves for layered performance attribution.
 
-    Equity starts at 1.0 and compounds daily:
-        equity_t = Π(1 + strategy_return_i)  for i ∈ [0, t]
+    Curves
+    ------
+    lgbm_naive_equity (v3 NEW)
+        Equity from naively following the sign of LightGBM's predicted_return
+        with a fixed unit position and no regime filter, no fees, no stop-loss.
+        Computed as:  cumprod(1 + sign(predicted_return) × target_return)
+        Purpose: isolates the raw model signal's contribution before any
+        risk management layer is applied.  If this is worse than gross_equity,
+        the regime gate is adding value; if better, it is not.
+
+    gross_equity (v3 NEW)
+        Equity from the regime-gated strategy *before* 0.15 % transaction fees
+        and before stop-loss zeroing.
+        Computed as:  cumprod(1 + gross_return)
+        Purpose: isolates the regime-filter + sizing contribution.
+        The gap between gross_equity and net equity quantifies pure fee drag.
+
+    equity (net)
+        Final strategy equity after all filters, fees, and stop-loss.
+        Computed as:  cumprod(1 + strategy_return)
+        This is the authoritative performance number.
+
+    Comparing the three curves at any point in time tells you:
+        lgbm_naive → gross  : value added by regime gating and sizing
+        gross → net         : cost of transaction fees and stop-loss exits
 
     Parameters
     ----------
     df : pd.DataFrame
-        DataFrame with *strategy_return* (net of costs and stop-loss).
+        Must contain *strategy_return* and *gross_return*.
+        Optionally contains *predicted_return* and *target_return* for
+        the LightGBM naive curve (skipped with a warning if absent).
 
     Returns
     -------
     pd.DataFrame
-        DataFrame with *equity* column appended.
+        DataFrame with *equity*, *gross_equity*, and (if available)
+        *lgbm_naive_equity* columns appended.
     """
     df = df.copy()
-    df["equity"] = (1 + df["strategy_return"]).cumprod()
 
-    start = df["equity"].iloc[0]
-    end   = df["equity"].iloc[-1]
+    # ── Net equity (authoritative) ────────────────────────────────────────
+    df["equity"] = (1.0 + df["strategy_return"]).cumprod()
+
+    # ── Gross equity (pre-fee, post regime-gate) ──────────────────────────
+    gross_col = "gross_return" if "gross_return" in df.columns else "strategy_return"
+    df["gross_equity"] = (1.0 + df[gross_col]).cumprod()
+
+    # ── LightGBM naive equity (no regime filter, no fees) ─────────────────
+    if "predicted_return" in df.columns and "target_return" in df.columns:
+        # direction: +1 if model predicts up, -1 if down, 0 if no signal
+        lgbm_dir = np.sign(df["predicted_return"].fillna(0))
+        lgbm_daily = lgbm_dir * df["target_return"]
+        df["lgbm_naive_equity"] = (1.0 + lgbm_daily).cumprod()
+        lgbm_end = float(df["lgbm_naive_equity"].iloc[-1])
+        lgbm_note = f"  |  LightGBM naive end: {lgbm_end:.4f} ({(lgbm_end-1)*100:+.2f} %)"
+    else:
+        df["lgbm_naive_equity"] = np.nan
+        lgbm_note = "  |  LightGBM naive curve: skipped (predicted_return not in dataset)"
+
+    net_end   = float(df["equity"].iloc[-1])
+    gross_end = float(df["gross_equity"].iloc[-1])
+
     print(
-        f"[compute_equity_curve]  Equity curve built — "
-        f"start: {start:.4f}  →  end: {end:.4f}  "
-        f"(net total: {(end - 1) * 100:+.2f} %)"
+        f"[compute_equity_curve]  "
+        f"Net end: {net_end:.4f} ({(net_end-1)*100:+.2f} %)  |  "
+        f"Gross end: {gross_end:.4f} ({(gross_end-1)*100:+.2f} %)"
+        + lgbm_note
     )
     return df
 
@@ -407,7 +551,7 @@ def compute_equity_curve(df: pd.DataFrame) -> pd.DataFrame:
 # 8. compute_drawdown
 # ===========================================================================
 def compute_drawdown(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute the rolling drawdown series from the equity curve.
+    """Compute the rolling drawdown series from the net equity curve.
 
     Formula
     -------
@@ -417,7 +561,7 @@ def compute_drawdown(df: pd.DataFrame) -> pd.DataFrame:
     Parameters
     ----------
     df : pd.DataFrame
-        DataFrame with *equity* column.
+        Must contain *equity* (net equity) column.
 
     Returns
     -------
@@ -432,7 +576,7 @@ def compute_drawdown(df: pd.DataFrame) -> pd.DataFrame:
     avg_dd     = df["drawdown"].mean()
     underwater = (df["drawdown"] < 0).sum()
     print(
-        f"[compute_drawdown]  Drawdown series built — "
+        f"[compute_drawdown]  "
         f"max: {max_dd * 100:.2f} %  |  "
         f"avg: {avg_dd * 100:.2f} %  |  "
         f"underwater rows: {underwater:,} / {len(df):,}"
@@ -441,49 +585,74 @@ def compute_drawdown(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===========================================================================
-# 9. compute_metrics
+# 9. compute_metrics   (v3: Regime-Gated Efficiency metrics added)
 # ===========================================================================
 def compute_metrics(
-    df: pd.DataFrame,
+    df:         pd.DataFrame,
     bnh_return: float,
-) -> dict[str, float | int | str]:
-    """Compute the full Techkriti competition scorecard metrics.
+) -> dict:
+    """Compute the full competition scorecard including Regime-Gated Efficiency.
 
-    Metrics
-    -------
-    gross_profit         : Sum of positive net strategy returns.
-    gross_loss           : Absolute sum of negative net strategy returns.
-    net_profit           : gross_profit − gross_loss.
-    total_cost_drag      : Total transaction costs deducted.
-    buy_hold_return      : Passive BTC return over the same period.
-    alpha                : Strategy return minus buy-and-hold return.
-    cumulative_return    : Total net return (decimal).
-    annual_return        : CAGR over the backtest period.
-    annual_volatility    : Annualised std of daily net returns.
-    sharpe_ratio         : Annualised Sharpe (Rf = 0).
-    sortino_ratio        : Annualised Sortino using downside deviation only.
-    calmar_ratio         : annual_return / |max_drawdown|.
-    max_drawdown         : Largest peak-to-trough equity decline.
-    total_closed_trades  : Count of BUY + SELL signal rows.
-    stopped_trades       : Rows zeroed by stop-loss rule.
-    win_rate             : Fraction of active rows with positive net return.
-    profit_factor        : gross_profit / gross_loss.
+    Standard Techkriti metrics (unchanged from v2)
+    -----------------------------------------------
+    gross_profit, gross_loss, net_profit, total_cost_drag,
+    buy_hold_return, alpha, cumulative_return, annual_return,
+    annual_volatility, sharpe_ratio, sortino_ratio, calmar_ratio,
+    max_drawdown, total_closed_trades, stopped_trades, win_rate,
+    profit_factor.
+
+    Regime-Gated Efficiency metrics (v3 NEW)
+    -----------------------------------------
+    n_entropy_suppressed
+        Count of rows where regime_entropy ≥ 0.50 AND signal == "HOLD" AND
+        |predicted_return| ≥ SIGNAL_CONFIDENCE_FLOOR.  These are rows that
+        survived the base-signal confidence filter but were suppressed by
+        the Entropy Kill-Switch (Gate 1).
+
+    n_regime_suppressed
+        Count of rows where regime_label ∈ {BULL, RECOVERY} AND
+        signal == "HOLD" AND regime_entropy < 0.50 AND
+        |predicted_return| ≥ SIGNAL_CONFIDENCE_FLOOR.  These survived the
+        entropy gate but were suppressed by the Regime Gate (Gate 2).
+
+    total_alpha_suppressed
+        n_entropy_suppressed + n_regime_suppressed.
+
+    equity_saved_high_entropy
+        Counterfactual equity preserved by the Entropy Kill-Switch.
+        For each entropy-suppressed row, a naive signal return is simulated:
+            sim_return = sign(predicted_return) × avg_active_position_size × target_return
+        Equity saved = cumulative loss that would have been incurred
+                     = −sum(sim_return[sim_return < 0])
+        A positive number means the entropy gate prevented that much loss.
+
+    n_hard_cash_lock_days
+        Total rows with position=0 due to Hard Cash Lock (not ordinary HOLD).
+
+    pct_active_days
+        Fraction of total rows where the strategy held an active position.
+
+    Equity curve comparison terminals (v3 NEW)
+    -------------------------------------------
+    lgbm_naive_final, gross_equity_final, net_equity_final
+        Terminal equity values of the three parallel curves, enabling
+        quick attribution without opening equity_curve.csv.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Enriched signals DataFrame with all computed columns.
     bnh_return : float
-        Buy-and-hold return from :func:`compute_buy_and_hold`.
 
     Returns
     -------
     dict
-        Complete Techkriti competition metrics mapping.
     """
     r      = df["strategy_return"]
     equity = df["equity"]
     n_days = len(r)
+
+    def _safe(v, d=4):
+        return round(v, d) if (isinstance(v, float) and not np.isnan(v)) else "N/A"
 
     # ── Profit breakdown ────────────────────────────────────────────────────
     active_net   = r[df["signal"] != "HOLD"]
@@ -521,9 +690,9 @@ def compute_metrics(
         if max_drawdown < 0 else np.nan
     )
 
-    # ── Trade statistics ────────────────────────────────────────────────────
+    # ── Trade statistics ─────────────────────────────────────────────────
     total_closed_trades = int((df["signal"] != "HOLD").sum())
-    stopped_trades      = (
+    stopped_trades = (
         int(df["stop_loss_triggered"].sum())
         if "stop_loss_triggered" in df.columns else 0
     )
@@ -540,44 +709,124 @@ def compute_metrics(
     date_start = str(df["date"].min().date())
     date_end   = str(df["date"].max().date())
 
-    def _safe(v, d=4):
-        return round(v, d) if (isinstance(v, float) and not np.isnan(v)) else "N/A"
+    # ── Regime-Gated Efficiency  (v3 NEW) ──────────────────────────────────
+    # All three optional columns (predicted_return, regime_entropy,
+    # regime_label) should be present in trading_signals.csv from v13.
+    # If missing (e.g. running on a v12 signals file), skip gracefully.
 
-    metrics = {
-        "date_start"          : date_start,
-        "date_end"            : date_end,
-        "total_days"          : n_days,
-        # ── Competition scorecard ────────────────────────────────────────
-        "gross_profit"        : round(gross_profit,      6),
-        "gross_loss"          : round(gross_loss,        6),
-        "net_profit"          : round(net_profit,        6),
-        "total_cost_drag"     : round(total_cost,        6),
-        "buy_hold_return"     : round(bnh_return,        6),
-        "alpha"               : round(alpha,             6),
-        "cumulative_return"   : round(cumulative_return, 6),
-        "annual_return"       : round(annual_return,     6),
-        "annual_volatility"   : round(annual_volatility, 6),
-        "sharpe_ratio"        : _safe(sharpe_ratio),
-        "sortino_ratio"       : _safe(sortino_ratio),
-        "calmar_ratio"        : _safe(calmar_ratio),
-        "max_drawdown"        : round(max_drawdown,      6),
-        "total_closed_trades" : total_closed_trades,
-        "stopped_trades"      : stopped_trades,
-        "win_rate"            : round(win_rate,          4),
-        "profit_factor"       : _safe(profit_factor),
-    }
+    has_pred    = "predicted_return" in df.columns
+    has_entropy = "regime_entropy"   in df.columns
+    has_label   = "regime_label"     in df.columns
+
+    n_entropy_suppressed  = 0
+    n_regime_suppressed   = 0
+    equity_saved_entropy  = 0.0
+    n_hard_cash_lock_days = 0
+    pct_active_days       = 0.0
+
+    if has_pred and has_entropy:
+        # Entropy-suppressed: signal=HOLD, entropy≥threshold, model had a real signal
+        ent_mask = (
+            (df["signal"] == "HOLD")
+            & (df["regime_entropy"] >= 0.50)
+            & (df["predicted_return"].abs() >= SIGNAL_CONFIDENCE_FLOOR)
+        )
+        n_entropy_suppressed = int(ent_mask.sum())
+
+        # Equity saved from high-entropy rows: counterfactual loss avoided.
+        # Use the mean position size of actually-traded rows as a proxy for
+        # what position size would have been taken in those suppressed rows.
+        avg_active_pos = float(
+            df.loc[df["signal"] != "HOLD", "position_size"].mean()
+        )
+        if n_entropy_suppressed > 0 and avg_active_pos > 0:
+            ent_rows = df[ent_mask].copy()
+            sim_dir  = np.sign(ent_rows["predicted_return"].fillna(0))
+            sim_ret  = sim_dir * avg_active_pos * ent_rows["target_return"]
+            # Equity saved = losses prevented (negative sim_ret values)
+            equity_saved_entropy = float(-sim_ret[sim_ret < 0].sum())
+
+    if has_pred and has_entropy and has_label:
+        # Regime-suppressed: BULL/RECOVERY rows that survived entropy gate
+        reg_mask = (
+            (df["signal"] == "HOLD")
+            & (df["regime_label"].isin(CASH_LOCKED_REGIMES))
+            & (df["regime_entropy"] < 0.50)
+            & (df["predicted_return"].abs() >= SIGNAL_CONFIDENCE_FLOOR)
+        )
+        n_regime_suppressed = int(reg_mask.sum())
+
+    total_alpha_suppressed = n_entropy_suppressed + n_regime_suppressed
+
+    if "is_hard_cash_lock" in df.columns:
+        n_hard_cash_lock_days = int(df["is_hard_cash_lock"].sum())
+
+    long_days       = int((df.get("position", pd.Series(0)) == 1).sum())
+    pct_active_days = float(long_days / max(n_days, 1))
+
+    # ── Equity curve terminals ───────────────────────────────────────────────
+    lgbm_naive_final  = (
+        float(df["lgbm_naive_equity"].iloc[-1])
+        if "lgbm_naive_equity" in df.columns and df["lgbm_naive_equity"].notna().any()
+        else np.nan
+    )
+    gross_equity_final = (
+        float(df["gross_equity"].iloc[-1])
+        if "gross_equity" in df.columns else np.nan
+    )
+    net_equity_final = float(equity.iloc[-1])
 
     print(
         f"[compute_metrics]  {n_days:,} days  ({date_start} → {date_end})  |  "
         f"Net profit: {net_profit * 100:+.2f} %  |  "
         f"B&H: {bnh_return * 100:+.2f} %  |  "
-        f"Alpha: {alpha * 100:+.2f} %"
+        f"Alpha: {alpha * 100:+.2f} %  |  "
+        f"Suppressed by alpha filter: {total_alpha_suppressed:,}"
     )
+
+    metrics = {
+        # ── Period ──────────────────────────────────────────────────────────
+        "date_start"              : date_start,
+        "date_end"                : date_end,
+        "total_days"              : n_days,
+        # ── Profit breakdown ────────────────────────────────────────────────
+        "gross_profit"            : round(gross_profit,      6),
+        "gross_loss"              : round(gross_loss,        6),
+        "net_profit"              : round(net_profit,        6),
+        "total_cost_drag"         : round(total_cost,        6),
+        # ── Benchmark comparison ─────────────────────────────────────────────
+        "buy_hold_return"         : round(bnh_return,        6),
+        "alpha"                   : round(alpha,             6),
+        "cumulative_return"       : round(cumulative_return, 6),
+        "annual_return"           : round(annual_return,     6),
+        "annual_volatility"       : round(annual_volatility, 6),
+        # ── Risk-adjusted metrics ─────────────────────────────────────────────
+        "sharpe_ratio"            : _safe(sharpe_ratio),
+        "sortino_ratio"           : _safe(sortino_ratio),
+        "calmar_ratio"            : _safe(calmar_ratio),
+        "max_drawdown"            : round(max_drawdown,      6),
+        # ── Trade statistics ─────────────────────────────────────────────────
+        "total_closed_trades"     : total_closed_trades,
+        "stopped_trades"          : stopped_trades,
+        "win_rate"                : round(win_rate,          4),
+        "profit_factor"           : _safe(profit_factor),
+        # ── Regime-Gated Efficiency (v3 NEW) ─────────────────────────────────
+        "n_entropy_suppressed"    : n_entropy_suppressed,
+        "n_regime_suppressed"     : n_regime_suppressed,
+        "total_alpha_suppressed"  : total_alpha_suppressed,
+        "equity_saved_entropy"    : round(equity_saved_entropy, 6),
+        "n_hard_cash_lock_days"   : n_hard_cash_lock_days,
+        "pct_active_days"         : round(pct_active_days,   4),
+        # ── Equity curve terminals (v3 NEW) ──────────────────────────────────
+        "lgbm_naive_final"        : _safe(lgbm_naive_final),
+        "gross_equity_final"      : _safe(gross_equity_final),
+        "net_equity_final"        : _safe(net_equity_final),
+    }
     return metrics
 
 
 # ===========================================================================
-# 10. save_results
+# 10. save_results   (v3: equity_curve.csv extended with gross/LightGBM curves)
 # ===========================================================================
 def save_results(
     df:            pd.DataFrame,
@@ -588,27 +837,50 @@ def save_results(
 ) -> None:
     """Persist equity curve, drawdown series, and competition report to disk.
 
+    equity_curve.csv columns (v3)
+    ------------------------------
+    date, close, signal, position, regime_label (if present),
+    regime_entropy (if present),
+    predicted_return (if present) — raw LightGBM model output,
+    gross_return                   — pre-fee strategy return,
+    transaction_cost               — fee deducted on real-trade rows,
+    strategy_return                — net return (post-fee, post-stop-loss),
+    lgbm_naive_equity              — cumulative equity: naive LightGBM signal,
+    gross_equity                   — cumulative equity: regime-gated, pre-fee,
+    equity                         — cumulative equity: regime-gated, post-fee.
+
+    The three equity columns allow direct visual comparison of:
+        LightGBM raw signal → regime filter value → fee cost
+    without any further computation.
+
     Parameters
     ----------
     df : pd.DataFrame
-        Enriched signals DataFrame.
     metrics : dict
-        Performance metrics from :func:`compute_metrics`.
     equity_path, drawdown_path, summary_path : Path or str
-        Output file paths.
     """
     for path in map(Path, (equity_path, drawdown_path, summary_path)):
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ── Equity curve ───────────────────────────────────────────────────────
-    eq_want = ["date", "close", "signal", "position", "gross_return",
-               "transaction_cost", "strategy_return", "equity"]
+    # ── Equity curve CSV ───────────────────────────────────────────────────
+    eq_want = [
+        "date", "close", "signal", "position",
+        "regime_label", "regime_entropy",        # optional v13 columns
+        "predicted_return",                      # LightGBM raw output
+        "gross_return",                          # pre-fee strategy return
+        "transaction_cost",
+        "strategy_return",                       # net return
+        "lgbm_naive_equity",                     # naive curve
+        "gross_equity",                          # pre-fee compounded curve
+        "equity",                                # net compounded curve
+    ]
     eq_cols = [c for c in eq_want if c in df.columns]
     df[eq_cols].to_csv(equity_path, index=False)
-    print(f"[save_results]  Equity curve saved       → '{equity_path}'")
+    print(f"[save_results]  Equity curve saved       → '{equity_path}'  "
+          f"(columns: {eq_cols})")
 
     # ── Drawdown series ────────────────────────────────────────────────────
-    dd_want = ["date", "equity", "rolling_max", "drawdown"]
+    dd_want = ["date", "equity", "gross_equity", "rolling_max", "drawdown"]
     dd_cols = [c for c in dd_want if c in df.columns]
     df[dd_cols].to_csv(drawdown_path, index=False)
     print(f"[save_results]  Drawdown series saved    → '{drawdown_path}'")
@@ -628,17 +900,17 @@ def backtest_pipeline(
     drawdown_path: Path | str = DRAWDOWN_PATH,
     summary_path:  Path | str = SUMMARY_PATH,
 ) -> tuple[pd.DataFrame, dict]:
-    """Execute the complete Techkriti-grade backtesting pipeline.
+    """Execute the complete v3 regime-gated backtesting pipeline.
 
     Steps
     -----
     1.  Load trading signals                   (:func:`load_signals`).
-    2.  Build position series from signals     (:func:`compute_positions`).
+    2.  Build position series (Hard Cash Lock) (:func:`compute_positions`).
     3.  Recompute strategy returns             (:func:`compute_strategy_returns`).
-    4.  Apply transaction costs on changes     (:func:`apply_transaction_costs`).
+    4.  Apply transaction costs (real trades)  (:func:`apply_transaction_costs`).
     5.  Apply stop-loss rule (−5 %)            (:func:`apply_stop_loss`).
     6.  Compute buy-and-hold benchmark         (:func:`compute_buy_and_hold`).
-    7.  Build equity curve                     (:func:`compute_equity_curve`).
+    7.  Build equity curves (net/gross/naive)  (:func:`compute_equity_curve`).
     8.  Compute drawdown series                (:func:`compute_drawdown`).
     9.  Calculate competition metrics          (:func:`compute_metrics`).
     10. Print professional scorecard.
@@ -649,7 +921,7 @@ def backtest_pipeline(
     df : pd.DataFrame
         Fully enriched signals DataFrame.
     metrics : dict
-        Techkriti competition scorecard.
+        Complete competition scorecard.
     """
     df         = load_signals(input_path)
     df         = compute_positions(df)
@@ -676,59 +948,96 @@ def backtest_pipeline(
 # Private helpers
 # ===========================================================================
 def _fmt_pct(value, decimals: int = 2) -> str:
-    """Format a decimal fraction as a signed percentage string."""
     if isinstance(value, str):
         return value
     return f"{value * 100:+.{decimals}f} %"
 
 
 def _fmt_float(value, decimals: int = 4) -> str:
-    """Format a plain float to *decimals* places."""
     if isinstance(value, str):
         return value
     return f"{value:.{decimals}f}"
 
 
+def _fmt_int(value) -> str:
+    if isinstance(value, str):
+        return value
+    return f"{int(value):,}"
+
+
 def _build_report(metrics: dict) -> str:
-    """Render the Techkriti competition scorecard as a structured text report."""
+    """Render the Techkriti competition scorecard as a structured text report.
+
+    v3 addition: Regime-Gated Efficiency section and Equity Attribution section.
+    """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    w  = 62
+    w  = 66
+
+    def _row(label, value, width=66):
+        return f"  {label:<36} {value}"
 
     lines = [
         "=" * w,
-        "   PROJECT ARI — TECHKRITI COMPETITION SCORECARD".center(w),
-        f"   Generated : {ts}".center(w),
+        "  PROJECT ARI — TECHKRITI COMPETITION SCORECARD".center(w),
+        f"  Generated : {ts}".center(w),
         "=" * w,
         "",
-        "  ── PERIOD ─────────────────────────────────────────────────",
-        f"  {'Start date':<32} {metrics['date_start']}",
-        f"  {'End date':<32} {metrics['date_end']}",
-        f"  {'Total trading days':<32} {metrics['total_days']:,}",
+        "  ── PERIOD ─────────────────────────────────────────────────────",
+        _row("Start date",          metrics["date_start"]),
+        _row("End date",            metrics["date_end"]),
+        _row("Total trading days",  _fmt_int(metrics["total_days"])),
         "",
-        "  ── PROFIT BREAKDOWN ────────────────────────────────────────",
-        f"  {'Gross Profit':<32} {_fmt_pct(metrics['gross_profit'])}",
-        f"  {'Gross Loss':<32} {_fmt_pct(metrics['gross_loss'])}",
-        f"  {'Net Profit':<32} {_fmt_pct(metrics['net_profit'])}",
-        f"  {'Transaction Cost Drag':<32} {_fmt_pct(metrics['total_cost_drag'])}",
+        "  ── PROFIT BREAKDOWN ────────────────────────────────────────────",
+        _row("Gross Profit",        _fmt_pct(metrics["gross_profit"])),
+        _row("Gross Loss",          _fmt_pct(metrics["gross_loss"])),
+        _row("Net Profit",          _fmt_pct(metrics["net_profit"])),
+        _row("Transaction Cost Drag", _fmt_pct(metrics["total_cost_drag"])),
         "",
-        "  ── BENCHMARK COMPARISON ────────────────────────────────────",
-        f"  {'Buy & Hold Return (BTC)':<32} {_fmt_pct(metrics['buy_hold_return'])}",
-        f"  {'Strategy Net Return':<32} {_fmt_pct(metrics['cumulative_return'])}",
-        f"  {'Alpha vs B&H':<32} {_fmt_pct(metrics['alpha'])}",
-        f"  {'Annualised Return (CAGR)':<32} {_fmt_pct(metrics['annual_return'])}",
-        f"  {'Annualised Volatility':<32} {_fmt_pct(metrics['annual_volatility'])}",
+        "  ── BENCHMARK COMPARISON ────────────────────────────────────────",
+        _row("Buy & Hold Return (BTC)",    _fmt_pct(metrics["buy_hold_return"])),
+        _row("Strategy Net Return",        _fmt_pct(metrics["cumulative_return"])),
+        _row("Alpha vs B&H",               _fmt_pct(metrics["alpha"])),
+        _row("Annualised Return (CAGR)",   _fmt_pct(metrics["annual_return"])),
+        _row("Annualised Volatility",      _fmt_pct(metrics["annual_volatility"])),
         "",
-        "  ── RISK-ADJUSTED METRICS ───────────────────────────────────",
-        f"  {'Sharpe Ratio':<32} {_fmt_float(metrics['sharpe_ratio'])}",
-        f"  {'Sortino Ratio':<32} {_fmt_float(metrics['sortino_ratio'])}",
-        f"  {'Calmar Ratio':<32} {_fmt_float(metrics['calmar_ratio'])}",
-        f"  {'Max Drawdown':<32} {_fmt_pct(metrics['max_drawdown'])}",
+        "  ── RISK-ADJUSTED METRICS ───────────────────────────────────────",
+        _row("Sharpe Ratio",        _fmt_float(metrics["sharpe_ratio"])),
+        _row("Sortino Ratio",       _fmt_float(metrics["sortino_ratio"])),
+        _row("Calmar Ratio",        _fmt_float(metrics["calmar_ratio"])),
+        _row("Max Drawdown",        _fmt_pct(metrics["max_drawdown"])),
         "",
-        "  ── TRADE STATISTICS ────────────────────────────────────────",
-        f"  {'Total Closed Trades':<32} {metrics['total_closed_trades']:,}",
-        f"  {'Stop-Loss Triggered (rows)':<32} {metrics['stopped_trades']:,}",
-        f"  {'Win Rate':<32} {_fmt_pct(metrics['win_rate'])}",
-        f"  {'Profit Factor':<32} {_fmt_float(metrics['profit_factor'])}",
+        "  ── TRADE STATISTICS ────────────────────────────────────────────",
+        _row("Total Closed Trades",         _fmt_int(metrics["total_closed_trades"])),
+        _row("Stop-Loss Triggered (rows)",  _fmt_int(metrics["stopped_trades"])),
+        _row("Days Active (% of period)",
+             f"{metrics['pct_active_days'] * 100:.1f} %"),
+        _row("Win Rate",                    _fmt_pct(metrics["win_rate"])),
+        _row("Profit Factor",               _fmt_float(metrics["profit_factor"])),
+        "",
+        # ── Regime-Gated Efficiency (v3 NEW) ──────────────────────────────
+        "  ── REGIME-GATED EFFICIENCY ────────────────────────────────────",
+        "  (Alpha Filter = Entropy Kill-Switch + Regime Gate)",
+        "",
+        _row("Total Signals Suppressed (Alpha Filter)",
+             _fmt_int(metrics["total_alpha_suppressed"])),
+        _row("  — by Entropy Kill-Switch  (entropy ≥ 0.50)",
+             _fmt_int(metrics["n_entropy_suppressed"])),
+        _row("  — by Regime Gate          (BULL / RECOVERY)",
+             _fmt_int(metrics["n_regime_suppressed"])),
+        "",
+        _row("Equity Saved from High-Entropy Periods",
+             _fmt_pct(metrics["equity_saved_entropy"])),
+        _row("Hard Cash Lock Days (regime-forced)",
+             _fmt_int(metrics["n_hard_cash_lock_days"])),
+        "",
+        # ── Equity attribution (v3 NEW) ───────────────────────────────────
+        "  ── EQUITY ATTRIBUTION (terminal equity, start = 1.00) ─────────",
+        _row("LightGBM Naive Equity  (no filter, no fee)",
+             _fmt_float(metrics["lgbm_naive_final"])),
+        _row("Gross Equity  (regime-gated, pre-fee)",
+             _fmt_float(metrics["gross_equity_final"])),
+        _row("Net Equity    (regime-gated, post-fee)",
+             _fmt_float(metrics["net_equity_final"])),
         "",
         "=" * w,
     ]
@@ -746,18 +1055,20 @@ def _print_report(metrics: dict) -> None:
 # Entry point
 # ===========================================================================
 def main() -> None:
-    """CLI entry point: run the competition-grade backtesting pipeline."""
-    print("=" * 62)
-    print("  Backtester Pipeline (Techkriti) — project_ari")
-    print("=" * 62)
+    """CLI entry point: run the v3 regime-gated backtesting pipeline."""
+    print("=" * 66)
+    print("  Backtester v3 — Regime-Gated  |  Project ARI")
+    print("=" * 66)
     try:
         df, metrics = backtest_pipeline()
         print(
-            f"Backtest complete.  "
-            f"Net profit: {metrics['net_profit'] * 100:+.2f} %  |  "
-            f"B&H: {metrics['buy_hold_return'] * 100:+.2f} %  |  "
-            f"Alpha: {metrics['alpha'] * 100:+.2f} %  |  "
-            f"Sharpe: {metrics['sharpe_ratio']}\n"
+            f"Backtest complete.\n"
+            f"  Net profit      : {metrics['net_profit'] * 100:+.2f} %\n"
+            f"  B&H             : {metrics['buy_hold_return'] * 100:+.2f} %\n"
+            f"  Alpha           : {metrics['alpha'] * 100:+.2f} %\n"
+            f"  Sharpe          : {metrics['sharpe_ratio']}\n"
+            f"  Suppressed      : {metrics['total_alpha_suppressed']:,} signals\n"
+            f"  Equity saved    : {metrics['equity_saved_entropy'] * 100:+.2f} %\n"
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"\n[ERROR] {exc}", file=sys.stderr)

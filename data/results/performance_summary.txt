@@ -1,36 +1,52 @@
-==============================================================
-          PROJECT ARI — TECHKRITI COMPETITION SCORECARD       
-                 Generated : 2026-03-10 19:05:02              
-==============================================================
+==================================================================
+           PROJECT ARI — TECHKRITI COMPETITION SCORECARD          
+                  Generated : 2026-03-20 01:29:33                 
+==================================================================
 
-  ── PERIOD ─────────────────────────────────────────────────
-  Start date                       2023-03-20
-  End date                         2023-12-30
-  Total trading days               286
+  ── PERIOD ─────────────────────────────────────────────────────
+  Start date                           2021-01-30
+  End date                             2023-12-15
+  Total trading days                   1,050
 
-  ── PROFIT BREAKDOWN ────────────────────────────────────────
-  Gross Profit                     +103.61 %
-  Gross Loss                       +64.00 %
-  Net Profit                       +39.62 %
-  Transaction Cost Drag            +0.92 %
+  ── PROFIT BREAKDOWN ────────────────────────────────────────────
+  Gross Profit                         +288.77 %
+  Gross Loss                           +240.60 %
+  Net Profit                           +48.17 %
+  Transaction Cost Drag                +1.49 %
 
-  ── BENCHMARK COMPARISON ────────────────────────────────────
-  Buy & Hold Return (BTC)          +51.82 %
-  Strategy Net Return              +45.27 %
-  Alpha vs B&H                     -6.55 %
-  Annualised Return (CAGR)         +38.96 %
-  Annualised Volatility            +20.14 %
+  ── BENCHMARK COMPARISON ────────────────────────────────────────
+  Buy & Hold Return (BTC)              +22.35 %
+  Strategy Net Return                  +49.51 %
+  Alpha vs B&H                         +27.16 %
+  Annualised Return (CAGR)             +10.13 %
+  Annualised Volatility                +19.52 %
 
-  ── RISK-ADJUSTED METRICS ───────────────────────────────────
-  Sharpe Ratio                     1.9349
-  Sortino Ratio                    2.6183
-  Calmar Ratio                     3.0534
-  Max Drawdown                     -12.76 %
+  ── RISK-ADJUSTED METRICS ───────────────────────────────────────
+  Sharpe Ratio                         0.5191
+  Sortino Ratio                        0.4317
+  Calmar Ratio                         0.4177
+  Max Drawdown                         -24.26 %
 
-  ── TRADE STATISTICS ────────────────────────────────────────
-  Total Closed Trades              165
-  Stop-Loss Triggered (rows)       0
-  Win Rate                         +43.64 %
-  Profit Factor                    1.6190
+  ── TRADE STATISTICS ────────────────────────────────────────────
+  Total Closed Trades                  519
+  Stop-Loss Triggered (rows)           19
+  Days Active (% of period)            39.9 %
+  Win Rate                             +38.73 %
+  Profit Factor                        1.2002
 
-==============================================================
+  ── REGIME-GATED EFFICIENCY ────────────────────────────────────
+  (Alpha Filter = Entropy Kill-Switch + Regime Gate)
+
+  Total Signals Suppressed (Alpha Filter) 293
+    — by Entropy Kill-Switch  (entropy ≥ 0.50) 20
+    — by Regime Gate          (BULL / RECOVERY) 273
+
+  Equity Saved from High-Entropy Periods +23.77 %
+  Hard Cash Lock Days (regime-forced)  531
+
+  ── EQUITY ATTRIBUTION (terminal equity, start = 1.00) ─────────
+  LightGBM Naive Equity  (no filter, no fee) 0.2996
+  Gross Equity  (regime-gated, pre-fee) 1.0753
+  Net Equity    (regime-gated, post-fee) 1.4951
+
+==================================================================
