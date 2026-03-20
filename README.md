@@ -47,3 +47,5 @@ To reproduce the +27.16% Alpha scorecard and equity plots:
 ---
 **Developer:** Yash | 2nd Year AIML Engineering (Pune)
 **Competition:** Techkriti '26 – IIT Kanpur (Beat the Market Challenge)
+
+hi
