@@ -1,3 +1,5 @@
+# ENTROPY VANGUARD GROUP presents
+
 # Project ARI: Adaptive Regime Intelligence (Techkriti '26)
 
 ## **Executive Summary**
